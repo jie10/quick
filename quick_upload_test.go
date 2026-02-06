@@ -9,6 +9,7 @@
 package quick
 
 import (
+	"archive/zip"
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
@@ -19,6 +20,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 )
 
@@ -60,7 +63,7 @@ func TestFormFile(t *testing.T) {
 	defer ts.Close()
 
 	// Call the HTTP abstraction function
-	bodyBytes, _ := sendMultipartRequest(t, ts.URL, "testfile.txt", "Hello, Quick!")
+	bodyBytes, _ := sendMultipartRequest(t, ts.URL, "testfile.txt", []byte("Hello, Quick!"))
 
 	// Decode response
 	var uploadedFile UploadedFileJSON
@@ -158,7 +161,7 @@ func TestFormFileTableDriven(t *testing.T) {
 			}
 
 			// Call the HTTP abstraction function
-			bodyBytes, _ := sendMultipartRequest(t, ts.URL, tt.fileName, tt.fileContent)
+			bodyBytes, _ := sendMultipartRequest(t, ts.URL, tt.fileName, []byte(tt.fileContent))
 
 			// Debugging: Print raw response
 			// fmt.Println("Raw Response Body:", string(bodyBytes))
@@ -262,7 +265,7 @@ func FuzzTestFormFile(f *testing.F) {
 		}
 
 		// Call the HTTP abstraction function
-		bodyBytes, _ := sendMultipartRequest(t, ts.URL, fileName, fileContent)
+		bodyBytes, _ := sendMultipartRequest(t, ts.URL, fileName, []byte(fileContent))
 
 		// Debugging: Print response
 		// fmt.Printf("[%s] Raw Response Body: %q\n", fileName, string(bodyBytes))
@@ -289,13 +292,421 @@ func FuzzTestFormFile(f *testing.F) {
 	})
 }
 
+func makeZipBytes(t *testing.T, files map[string][]byte) []byte {
+	t.Helper()
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+
+	for name, content := range files {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatalf("failed to create zip entry %q: %v", name, err)
+		}
+		if _, err := w.Write(content); err != nil {
+			t.Fatalf("failed to write zip entry %q: %v", name, err)
+		}
+	}
+
+	if err := zw.Close(); err != nil {
+		t.Fatalf("failed to close zip writer: %v", err)
+	}
+
+	return buf.Bytes()
+}
+
+// TestFormFile_ContentTypeOffice ensures common Office formats are recognized.
+//
+// Run: go test -v -run ^TestFormFile_ContentTypeOffice$
+func TestFormFile_ContentTypeOffice(t *testing.T) {
+	q := New()
+	q.Post("/upload", func(c *Ctx) error {
+		uploadedFile, err := c.FormFile("file")
+		if err != nil {
+			return c.Status(400).JSON(map[string]string{
+				"error": err.Error(),
+			})
+		}
+		return c.Status(200).JSONIN(uploadedFile)
+	})
+
+	ts := httptest.NewServer(q)
+	defer ts.Close()
+
+	wordZip := makeZipBytes(t, map[string][]byte{"word/document.xml": []byte("<w:document/>")})
+	excelZip := makeZipBytes(t, map[string][]byte{"xl/workbook.xml": []byte("<workbook/>")})
+	pptZip := makeZipBytes(t, map[string][]byte{"ppt/presentation.xml": []byte("<presentation/>")})
+
+	tests := []struct {
+		name         string
+		fileName     string
+		fileContent  []byte
+		expectedType string
+	}{
+		{
+			name:         "DOCX",
+			fileName:     "test.docx",
+			fileContent:  wordZip,
+			expectedType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+		},
+		{
+			name:         "DOCM",
+			fileName:     "test.docm",
+			fileContent:  wordZip,
+			expectedType: "application/vnd.ms-word.document.macroEnabled.12",
+		},
+		{
+			name:         "DOTX",
+			fileName:     "test.dotx",
+			fileContent:  wordZip,
+			expectedType: "application/vnd.openxmlformats-officedocument.wordprocessingml.template",
+		},
+		{
+			name:         "DOTM",
+			fileName:     "test.dotm",
+			fileContent:  wordZip,
+			expectedType: "application/vnd.ms-word.template.macroEnabled.12",
+		},
+		{
+			name:         "XLSX",
+			fileName:     "test.xlsx",
+			fileContent:  excelZip,
+			expectedType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+		},
+		{
+			name:         "XLSM",
+			fileName:     "test.xlsm",
+			fileContent:  excelZip,
+			expectedType: "application/vnd.ms-excel.sheet.macroEnabled.12",
+		},
+		{
+			name:         "XLTX",
+			fileName:     "test.xltx",
+			fileContent:  excelZip,
+			expectedType: "application/vnd.openxmlformats-officedocument.spreadsheetml.template",
+		},
+		{
+			name:         "XLTM",
+			fileName:     "test.xltm",
+			fileContent:  excelZip,
+			expectedType: "application/vnd.ms-excel.template.macroEnabled.12",
+		},
+		{
+			name:         "XLAM",
+			fileName:     "test.xlam",
+			fileContent:  excelZip,
+			expectedType: "application/vnd.ms-excel.addin.macroEnabled.12",
+		},
+		{
+			name:         "XLSB",
+			fileName:     "test.xlsb",
+			fileContent:  excelZip,
+			expectedType: "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
+		},
+		{
+			name:         "PPTX",
+			fileName:     "test.pptx",
+			fileContent:  pptZip,
+			expectedType: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+		},
+		{
+			name:         "PPTM",
+			fileName:     "test.pptm",
+			fileContent:  pptZip,
+			expectedType: "application/vnd.ms-powerpoint.presentation.macroEnabled.12",
+		},
+		{
+			name:         "POTX",
+			fileName:     "test.potx",
+			fileContent:  pptZip,
+			expectedType: "application/vnd.openxmlformats-officedocument.presentationml.template",
+		},
+		{
+			name:         "POTM",
+			fileName:     "test.potm",
+			fileContent:  pptZip,
+			expectedType: "application/vnd.ms-powerpoint.template.macroEnabled.12",
+		},
+		{
+			name:         "PPSX",
+			fileName:     "test.ppsx",
+			fileContent:  pptZip,
+			expectedType: "application/vnd.openxmlformats-officedocument.presentationml.slideshow",
+		},
+		{
+			name:         "PPSM",
+			fileName:     "test.ppsm",
+			fileContent:  pptZip,
+			expectedType: "application/vnd.ms-powerpoint.slideshow.macroEnabled.12",
+		},
+		{
+			name:         "SLDX",
+			fileName:     "test.sldx",
+			fileContent:  pptZip,
+			expectedType: "application/vnd.openxmlformats-officedocument.presentationml.slide",
+		},
+		{
+			name:         "SLDM",
+			fileName:     "test.sldm",
+			fileContent:  pptZip,
+			expectedType: "application/vnd.ms-powerpoint.slide.macroEnabled.12",
+		},
+		{
+			name:         "PPAM",
+			fileName:     "test.ppam",
+			fileContent:  pptZip,
+			expectedType: "application/vnd.ms-powerpoint.addin.macroEnabled.12",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bodyBytes, err := sendMultipartRequest(t, ts.URL, tt.fileName, tt.fileContent)
+			if err != nil {
+				t.Fatalf("failed to send multipart request: %v", err)
+			}
+
+			var uploadedFile UploadedFileJSON
+			if err := json.Unmarshal(bodyBytes, &uploadedFile); err != nil {
+				t.Fatalf("failed to decode response: %v", err)
+			}
+
+			if uploadedFile.Info.ContentType != tt.expectedType {
+				t.Errorf("expected content type %s, got %s", tt.expectedType, uploadedFile.Info.ContentType)
+			}
+		})
+	}
+}
+
+// TestFormFile_ContentTypeZipSpoofing ensures we don't mislabel a generic zip as Office based only on extension.
+//
+// Run: go test -v -run ^TestFormFile_ContentTypeZipSpoofing$
+func TestFormFile_ContentTypeZipSpoofing(t *testing.T) {
+	q := New()
+	q.Post("/upload", func(c *Ctx) error {
+		uploadedFile, err := c.FormFile("file")
+		if err != nil {
+			return c.Status(400).JSON(map[string]string{
+				"error": err.Error(),
+			})
+		}
+		return c.Status(200).JSONIN(uploadedFile)
+	})
+
+	ts := httptest.NewServer(q)
+	defer ts.Close()
+
+	bodyBytes, err := sendMultipartRequest(t, ts.URL, "not-office.docx", makeZipBytes(t, map[string][]byte{"random.txt": []byte("hello")}))
+	if err != nil {
+		t.Fatalf("failed to send multipart request: %v", err)
+	}
+
+	var uploadedFile UploadedFileJSON
+	if err := json.Unmarshal(bodyBytes, &uploadedFile); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if uploadedFile.Info.ContentType != "application/zip" {
+		t.Errorf("expected content type %s, got %s", "application/zip", uploadedFile.Info.ContentType)
+	}
+}
+
+// TestFormFile_ContentTypeCommon ensures common file types are recognized.
+//
+// Run: go test -v -run ^TestFormFile_ContentTypeCommon$
+func TestFormFile_ContentTypeCommon(t *testing.T) {
+	q := New()
+	q.Post("/upload", func(c *Ctx) error {
+		uploadedFile, err := c.FormFile("file")
+		if err != nil {
+			return c.Status(400).JSON(map[string]string{
+				"error": err.Error(),
+			})
+		}
+		return c.Status(200).JSONIN(uploadedFile)
+	})
+
+	ts := httptest.NewServer(q)
+	defer ts.Close()
+
+	jarZip := makeZipBytes(t, map[string][]byte{
+		"META-INF/MANIFEST.MF": []byte("Manifest-Version: 1.0\n"),
+	})
+
+	tests := []struct {
+		name         string
+		fileName     string
+		fileContent  []byte
+		expectedType string
+	}{
+		{
+			name:         "PNG",
+			fileName:     "image.png",
+			fileContent:  append([]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}, bytes.Repeat([]byte{0x00}, 16)...),
+			expectedType: "image/png",
+		},
+		{
+			name:         "JPEG",
+			fileName:     "image.jpg",
+			fileContent:  []byte{0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0x00},
+			expectedType: "image/jpeg",
+		},
+		{
+			name:         "GIF",
+			fileName:     "image.gif",
+			fileContent:  []byte("GIF89a"),
+			expectedType: "image/gif",
+		},
+		{
+			name:         "PDF",
+			fileName:     "file.pdf",
+			fileContent:  []byte("%PDF-1.7\n"),
+			expectedType: "application/pdf",
+		},
+		{
+			name:         "JSON",
+			fileName:     "data.json",
+			fileContent:  []byte(`{"a":1}`),
+			expectedType: "application/json",
+		},
+		{
+			name:         "CSV",
+			fileName:     "data.csv",
+			fileContent:  []byte("a,b\n1,2\n"),
+			expectedType: "text/csv; charset=utf-8",
+		},
+		{
+			name:         "YAML",
+			fileName:     "data.yaml",
+			fileContent:  []byte("a: b\n"),
+			expectedType: "application/x-yaml",
+		},
+		{
+			name:         "SVG",
+			fileName:     "image.svg",
+			fileContent:  []byte(`<svg xmlns="http://www.w3.org/2000/svg"></svg>`),
+			expectedType: "image/svg+xml",
+		},
+		{
+			name:         "JAR",
+			fileName:     "app.jar",
+			fileContent:  jarZip,
+			expectedType: "application/java-archive",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bodyBytes, err := sendMultipartRequest(t, ts.URL, tt.fileName, tt.fileContent)
+			if err != nil {
+				t.Fatalf("failed to send multipart request: %v", err)
+			}
+
+			var uploadedFile UploadedFileJSON
+			if err := json.Unmarshal(bodyBytes, &uploadedFile); err != nil {
+				t.Fatalf("failed to decode response: %v", err)
+			}
+
+			if uploadedFile.Info.ContentType != tt.expectedType {
+				t.Errorf("expected content type %s, got %s", tt.expectedType, uploadedFile.Info.ContentType)
+			}
+		})
+	}
+}
+
+func TestContentTypeByExtension_Common(t *testing.T) {
+	for ext, expected := range commonExtTypes {
+		got := contentTypeByExtension("file" + ext)
+		if got != expected {
+			t.Errorf("expected %q for %q, got %q", expected, ext, got)
+		}
+	}
+}
+
+// TestFormFile_ContentTypeCommon_AllExtensions ensures all extensions in `commonExtTypes`
+// are returned as-is when content sniffing is generic (or zip containers are used).
+//
+// Run: go test -v -run ^TestFormFile_ContentTypeCommon_AllExtensions$
+func TestFormFile_ContentTypeCommon_AllExtensions(t *testing.T) {
+	q := New()
+	q.Post("/upload", func(c *Ctx) error {
+		uploadedFile, err := c.FormFile("file")
+		if err != nil {
+			return c.Status(400).JSON(map[string]string{
+				"error": err.Error(),
+			})
+		}
+		return c.Status(200).JSONIN(uploadedFile)
+	})
+
+	ts := httptest.NewServer(q)
+	defer ts.Close()
+
+	zipPayload := makeZipBytes(t, map[string][]byte{
+		"random.txt": []byte("hello"),
+	})
+
+	exts := make([]string, 0, len(commonExtTypes))
+	for ext := range commonExtTypes {
+		exts = append(exts, ext)
+	}
+	sort.Strings(exts)
+
+	for _, ext := range exts {
+		expectedType := commonExtTypes[ext]
+
+		t.Run(ext, func(t *testing.T) {
+			fileName := "file" + ext
+			payload := []byte{0x00, 0x01, 0x02, 0x03} // forces application/octet-stream
+
+			switch ext {
+			case ".jar", ".epub", ".apk",
+				".odt", ".ods", ".odp", ".odg", ".odc", ".odi", ".odf", ".odb",
+				".ott", ".ots", ".otp", ".otg":
+				payload = zipPayload
+			default:
+				base := baseMediaType(expectedType)
+				if strings.HasPrefix(base, "text/") || base == "application/json" || base == "application/rtf" {
+					payload = []byte("a,b\n1,2\n")
+				}
+				if base == "image/svg+xml" {
+					payload = []byte(`<svg xmlns="http://www.w3.org/2000/svg"></svg>`)
+				}
+				if strings.Contains(base, "yaml") {
+					payload = []byte("a: b\n")
+				}
+				if strings.Contains(base, "toml") {
+					payload = []byte("a = 1\n")
+				}
+				if strings.Contains(base, "markdown") {
+					payload = []byte("# Title\n")
+				}
+			}
+
+			bodyBytes, err := sendMultipartRequest(t, ts.URL, fileName, payload)
+			if err != nil {
+				t.Fatalf("failed to send multipart request: %v", err)
+			}
+
+			var uploadedFile UploadedFileJSON
+			if err := json.Unmarshal(bodyBytes, &uploadedFile); err != nil {
+				t.Fatalf("failed to decode response: %v", err)
+			}
+
+			if uploadedFile.Info.ContentType != expectedType {
+				t.Errorf("expected content type %s, got %s", expectedType, uploadedFile.Info.ContentType)
+			}
+		})
+	}
+}
+
 // sendMultipartRequest creates and sends a POST request with multipart/form-data
 // using the provided test server URL, fileName and fileContent.
 // It returns the response body as a byte slice or an error if any step fails.
-// The result will sendMultipartRequest(t *testing.T, tsURL, fileName, fileContent string) ([]byte, error)
-func sendMultipartRequest(t *testing.T, tsURL, fileName, fileContent string) ([]byte, error) {
+// The result will sendMultipartRequest(t *testing.T, tsURL, fileName string, fileContent []byte) ([]byte, error)
+func sendMultipartRequest(t *testing.T, tsURL, fileName string, fileContent []byte) ([]byte, error) {
 	// Validate that fileContent is not empty
-	if fileContent == "" {
+	if len(fileContent) == 0 {
 		return nil, fmt.Errorf("file content cannot be empty")
 	}
 
@@ -310,7 +721,7 @@ func sendMultipartRequest(t *testing.T, tsURL, fileName, fileContent string) ([]
 	}
 
 	// Write the file content to the form file field
-	_, err = io.Copy(formFile, bytes.NewReader([]byte(fileContent)))
+	_, err = io.Copy(formFile, bytes.NewReader(fileContent))
 	if err != nil {
 		return nil, fmt.Errorf("failed to copy file content: %v", err)
 	}

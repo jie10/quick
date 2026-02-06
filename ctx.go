@@ -18,6 +18,7 @@
 package quick
 
 import (
+	"archive/zip"
 	"bufio"
 	"bytes"
 	"context"
@@ -26,6 +27,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"mime"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -383,6 +386,8 @@ func (c *Ctx) File(filePath string) error {
 		filePath = strings.TrimPrefix(filePath, "./")
 
 		if strings.HasSuffix(filePath, "/") || filePath == "" {
+			filePath = filepath.Join(filePath, "index.html")
+		} else if info, err := fs.Stat(c.App.embedFS, filePath); err == nil && info.IsDir() {
 			filePath = filepath.Join(filePath, "index.html")
 		}
 
@@ -872,7 +877,7 @@ func (c *Ctx) FormFiles(fieldName string) ([]*UploadedFile, error) {
 		fileCopy := &fileWrapper{bytes.NewReader(buf.Bytes())}
 
 		// Detect content type
-		contentType := http.DetectContentType(buf.Bytes())
+		fileContentType := detectUploadedFileContentType(handler, buf.Bytes())
 
 		// Append file details
 		uploadedFiles = append(uploadedFiles, &UploadedFile{
@@ -881,13 +886,262 @@ func (c *Ctx) FormFiles(fieldName string) ([]*UploadedFile, error) {
 			Info: FileInfo{
 				Filename:    handler.Filename,
 				Size:        handler.Size,
-				ContentType: contentType,
+				ContentType: fileContentType,
 				Bytes:       buf.Bytes(),
 			},
 		})
 	}
 
 	return uploadedFiles, nil
+}
+
+func detectUploadedFileContentType(handler *multipart.FileHeader, fileBytes []byte) string {
+	filename := ""
+	partContentType := ""
+	if handler != nil {
+		filename = handler.Filename
+		partContentType = strings.TrimSpace(handler.Header.Get("Content-Type"))
+	}
+
+	ext := strings.ToLower(filepath.Ext(filename))
+	extContentType := contentTypeByExtension(filename)
+	extBase := baseMediaType(extContentType)
+
+	sniffed := http.DetectContentType(fileBytes)
+	sniffBase := baseMediaType(sniffed)
+	partBase := baseMediaType(partContentType)
+
+	if sniffBase != "" && sniffBase != "application/zip" && !isGenericMediaType(sniffBase) {
+		if sniffBase != "text/plain" || extBase == "" || extBase == "text/plain" {
+			return sniffed
+		}
+	}
+	if partContentType != "" && partBase != "" && partBase != "application/zip" && !isGenericMediaType(partBase) {
+		if partBase != "text/plain" || extBase == "" || extBase == "text/plain" {
+			return partContentType
+		}
+	}
+
+	if sniffBase == "application/zip" || partBase == "application/zip" {
+		if kind := officeKindFromZip(fileBytes); kind != officeUnknown {
+			if info, ok := officeExtTypes[ext]; ok && info.kind == kind {
+				return info.mime
+			}
+			if fallback := defaultOfficeMime(kind); fallback != "" {
+				return fallback
+			}
+		}
+		if _, ok := officeExtTypes[ext]; ok {
+			return sniffed
+		}
+		if extContentType != "" && extBase != "" && extBase != "application/zip" {
+			return extContentType
+		}
+		return sniffed
+	}
+
+	if extContentType != "" &&
+		(isGenericMediaType(sniffBase) || isGenericMediaType(partBase) ||
+			(sniffBase == "text/plain" && extBase != "" && extBase != "text/plain") ||
+			(partBase == "text/plain" && extBase != "" && extBase != "text/plain")) {
+		return extContentType
+	}
+
+	return sniffed
+}
+
+type officeKind uint8
+
+const (
+	officeUnknown officeKind = iota
+	officeWord
+	officeExcel
+	officePowerPoint
+)
+
+type officeExtInfo struct {
+	mime string
+	kind officeKind
+}
+
+var officeExtTypes = map[string]officeExtInfo{
+	// Word (legacy)
+	".doc": {mime: "application/msword", kind: officeWord},
+	".dot": {mime: "application/msword", kind: officeWord},
+	// Word (OOXML)
+	".docx": {mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", kind: officeWord},
+	".docm": {mime: "application/vnd.ms-word.document.macroEnabled.12", kind: officeWord},
+	".dotx": {mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.template", kind: officeWord},
+	".dotm": {mime: "application/vnd.ms-word.template.macroEnabled.12", kind: officeWord},
+
+	// Excel (legacy)
+	".xls": {mime: "application/vnd.ms-excel", kind: officeExcel},
+	".xlt": {mime: "application/vnd.ms-excel", kind: officeExcel},
+	".xla": {mime: "application/vnd.ms-excel", kind: officeExcel},
+	// Excel (OOXML)
+	".xlsx": {mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", kind: officeExcel},
+	".xlsm": {mime: "application/vnd.ms-excel.sheet.macroEnabled.12", kind: officeExcel},
+	".xltx": {mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.template", kind: officeExcel},
+	".xltm": {mime: "application/vnd.ms-excel.template.macroEnabled.12", kind: officeExcel},
+	".xlam": {mime: "application/vnd.ms-excel.addin.macroEnabled.12", kind: officeExcel},
+	".xlsb": {mime: "application/vnd.ms-excel.sheet.binary.macroEnabled.12", kind: officeExcel},
+
+	// PowerPoint (legacy)
+	".ppt": {mime: "application/vnd.ms-powerpoint", kind: officePowerPoint},
+	".pps": {mime: "application/vnd.ms-powerpoint", kind: officePowerPoint},
+	".pot": {mime: "application/vnd.ms-powerpoint", kind: officePowerPoint},
+	".ppa": {mime: "application/vnd.ms-powerpoint", kind: officePowerPoint},
+	// PowerPoint (OOXML)
+	".pptx": {mime: "application/vnd.openxmlformats-officedocument.presentationml.presentation", kind: officePowerPoint},
+	".pptm": {mime: "application/vnd.ms-powerpoint.presentation.macroEnabled.12", kind: officePowerPoint},
+	".potx": {mime: "application/vnd.openxmlformats-officedocument.presentationml.template", kind: officePowerPoint},
+	".potm": {mime: "application/vnd.ms-powerpoint.template.macroEnabled.12", kind: officePowerPoint},
+	".ppsx": {mime: "application/vnd.openxmlformats-officedocument.presentationml.slideshow", kind: officePowerPoint},
+	".ppsm": {mime: "application/vnd.ms-powerpoint.slideshow.macroEnabled.12", kind: officePowerPoint},
+	".sldx": {mime: "application/vnd.openxmlformats-officedocument.presentationml.slide", kind: officePowerPoint},
+	".sldm": {mime: "application/vnd.ms-powerpoint.slide.macroEnabled.12", kind: officePowerPoint},
+	".ppam": {mime: "application/vnd.ms-powerpoint.addin.macroEnabled.12", kind: officePowerPoint},
+}
+
+var commonExtTypes = map[string]string{
+	// Documents / structured text
+	".json":     "application/json",
+	".csv":      "text/csv; charset=utf-8",
+	".tsv":      "text/tab-separated-values; charset=utf-8",
+	".yaml":     "application/x-yaml",
+	".yml":      "application/x-yaml",
+	".toml":     "application/toml",
+	".md":       "text/markdown; charset=utf-8",
+	".markdown": "text/markdown; charset=utf-8",
+	".rtf":      "application/rtf",
+
+	// Images
+	".svg":  "image/svg+xml",
+	".avif": "image/avif",
+	".heic": "image/heic",
+	".heif": "image/heif",
+	".tif":  "image/tiff",
+	".tiff": "image/tiff",
+	".ico":  "image/vnd.microsoft.icon",
+
+	// Archives / packages
+	".7z":   "application/x-7z-compressed",
+	".rar":  "application/vnd.rar",
+	".tar":  "application/x-tar",
+	".gz":   "application/gzip",
+	".tgz":  "application/gzip",
+	".bz2":  "application/x-bzip2",
+	".xz":   "application/x-xz",
+	".zst":  "application/zstd",
+	".jar":  "application/java-archive",
+	".epub": "application/epub+zip",
+	".apk":  "application/vnd.android.package-archive",
+
+	// OpenDocument (ODF)
+	".odt": "application/vnd.oasis.opendocument.text",
+	".ods": "application/vnd.oasis.opendocument.spreadsheet",
+	".odp": "application/vnd.oasis.opendocument.presentation",
+	".odg": "application/vnd.oasis.opendocument.graphics",
+	".odc": "application/vnd.oasis.opendocument.chart",
+	".odi": "application/vnd.oasis.opendocument.image",
+	".odf": "application/vnd.oasis.opendocument.formula",
+	".odb": "application/vnd.oasis.opendocument.database",
+	".ott": "application/vnd.oasis.opendocument.text-template",
+	".ots": "application/vnd.oasis.opendocument.spreadsheet-template",
+	".otp": "application/vnd.oasis.opendocument.presentation-template",
+	".otg": "application/vnd.oasis.opendocument.graphics-template",
+
+	// Audio
+	".mp3":  "audio/mpeg",
+	".wav":  "audio/wav",
+	".flac": "audio/flac",
+	".ogg":  "audio/ogg",
+	".opus": "audio/opus",
+	".aac":  "audio/aac",
+	".m4a":  "audio/mp4",
+
+	// Video
+	".mp4":  "video/mp4",
+	".mov":  "video/quicktime",
+	".mkv":  "video/x-matroska",
+	".webm": "video/webm",
+	".avi":  "video/x-msvideo",
+	".m4v":  "video/x-m4v",
+}
+
+func officeKindFromZip(fileBytes []byte) officeKind {
+	zr, err := zip.NewReader(bytes.NewReader(fileBytes), int64(len(fileBytes)))
+	if err != nil {
+		return officeUnknown
+	}
+
+	for _, f := range zr.File {
+		name := f.Name
+		switch {
+		case strings.HasPrefix(name, "word/"):
+			return officeWord
+		case strings.HasPrefix(name, "xl/"):
+			return officeExcel
+		case strings.HasPrefix(name, "ppt/"):
+			return officePowerPoint
+		}
+	}
+
+	return officeUnknown
+}
+
+func defaultOfficeMime(kind officeKind) string {
+	switch kind {
+	case officeWord:
+		return officeExtTypes[".docx"].mime
+	case officeExcel:
+		return officeExtTypes[".xlsx"].mime
+	case officePowerPoint:
+		return officeExtTypes[".pptx"].mime
+	default:
+		return ""
+	}
+}
+
+func baseMediaType(contentType string) string {
+	contentType = strings.TrimSpace(contentType)
+	if contentType == "" {
+		return ""
+	}
+	if idx := strings.IndexByte(contentType, ';'); idx >= 0 {
+		contentType = contentType[:idx]
+	}
+	return strings.ToLower(strings.TrimSpace(contentType))
+}
+
+func isGenericMediaType(baseMediaType string) bool {
+	switch baseMediaType {
+	case "", "application/octet-stream", "binary/octet-stream":
+		return true
+	default:
+		return false
+	}
+}
+
+func contentTypeByExtension(filename string) string {
+	ext := strings.ToLower(filepath.Ext(filename))
+	if ext == "" {
+		return ""
+	}
+
+	if info, ok := officeExtTypes[ext]; ok {
+		return info.mime
+	}
+
+	if mimeType, ok := commonExtTypes[ext]; ok {
+		return mimeType
+	}
+
+	if mimeType := mime.TypeByExtension(ext); mimeType != "" {
+		return mimeType
+	}
+
+	return ""
 }
 
 // MultipartForm provides access to the raw multipart form data.
